@@ -1,0 +1,189 @@
+version: 2.1
+
+parameters:
+  workflow:
+    type: enum
+    enum: ["mirror-vendor", "mirror-ai", "lint-circleci-config"]
+    default: "lint-circleci-config"
+  SERVICE:
+    type: enum
+    enum: [ "formio-enterprise", "formio-pdf", "spell-checker", "cke-core", "cke-docx", "etlworks-app", "metabase", "genai-api", "pdf-nlm-ingestor", "text-embeddings-inference" ]
+    default: "formio-enterprise"
+  TAG:
+    type: string
+    default: ""
+  DEST_TAG:
+    type: string
+    default: ""
+  EXPECTED_SHA:
+    type: string
+    default: ""
+
+commands:
+  install_aws_shims:
+    steps:
+      - run:
+          name: Install dual AWS CLI shims (source & dest)
+          command: |
+            set -euo pipefail
+
+            cat >/usr/local/bin/aws-src \<<'EOF'
+            #!/bin/sh
+            set -e
+            : "${DEST_AWS_ACCESS_KEY:?missing DEST_AWS_ACCESS_KEY}"
+            : "${DEST_AWS_ACCESS_SECRET_KEY:?missing DEST_AWS_ACCESS_SECRET_KEY}"
+            DEST_REGION="${DEST_AWS_REGION:-us-gov-west-1}"
+
+            export AWS_ACCESS_KEY_ID="$DEST_AWS_ACCESS_KEY"
+            export AWS_SECRET_ACCESS_KEY="$DEST_AWS_ACCESS_SECRET_KEY"
+            export AWS_SESSION_TOKEN="${DEST_AWS_SESSION_TOKEN:-}"
+            export AWS_REGION="$DEST_REGION"
+            export AWS_DEFAULT_REGION="$DEST_REGION"
+            export AWS_SDK_LOAD_CONFIG=0
+
+            exec docker run --rm -i \
+              -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+              -e AWS_REGION -e AWS_DEFAULT_REGION -e AWS_SDK_LOAD_CONFIG \
+              public.ecr.aws/aws-cli/aws-cli:latest "$@"
+            EOF
+            chmod +x /usr/local/bin/aws-src
+
+            cat >/usr/local/bin/aws-dest \<<'EOF'
+            #!/bin/sh
+            set -e
+            : "${SRC_AWS_ACCESS_KEY:?missing SRC_AWS_ACCESS_KEY}"
+            : "${SRC_AWS_ACCESS_SECRET_KEY:?missing SRC_AWS_ACCESS_SECRET_KEY}"
+            DEST_REGION="${DEST_AWS_REGION:-us-gov-west-1}"
+
+            export AWS_ACCESS_KEY_ID="$SRC_AWS_ACCESS_KEY"
+            export AWS_SECRET_ACCESS_KEY="$SRC_AWS_ACCESS_SECRET_KEY"
+            export AWS_SESSION_TOKEN="${SRC_AWS_SESSION_TOKEN:-}"
+            export AWS_REGION="$DEST_REGION"
+            export AWS_DEFAULT_REGION="$DEST_REGION"
+            export AWS_SDK_LOAD_CONFIG=0
+
+            exec docker run --rm -i \
+              -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+              -e AWS_REGION -e AWS_DEFAULT_REGION -e AWS_SDK_LOAD_CONFIG \
+              public.ecr.aws/aws-cli/aws-cli:latest "$@"
+            EOF
+            chmod +x /usr/local/bin/aws-dest
+
+            # Sanity checks
+            aws-src --version
+            aws-dest --version
+            aws-src sts get-caller-identity >/dev/null
+            aws-dest sts get-caller-identity >/dev/null
+
+jobs:
+  lint-circleci-config:
+    docker:
+      - image: cimg/base:stable
+    resource_class: <organization>/container
+    steps:
+      - checkout
+      - run:
+          name: Install/Update CircleCI CLI
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y curl
+            curl -fLSs https://circle.ci/cli | sudo bash
+      - run:
+          name: Validate CircleCI Config
+          command: circleci config validate
+
+  mirror-vendor-remote-docker:
+    docker:
+      - image: docker:24.0.9-cli
+    environment:
+      SERVICE: << pipeline.parameters.SERVICE >>
+      TAG: << pipeline.parameters.TAG >>
+      EXPECTED_SHA: << pipeline.parameters.EXPECTED_SHA >>
+      SRC_AWS_REGION: us-west-2
+      SRC_ECR: <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
+      DEST_AWS_REGION: us-gov-west-1
+      DEST_ECR: <aws_account_id>.dkr.ecr.us-gov-west-1.amazonaws.com
+      AWS_SDK_LOAD_CONFIG: "0"
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Minimal tools
+          command: apk add --no-cache bash jq coreutils grep
+      - install_aws_shims
+      - run:
+          name: Login to source & destination ECR
+          command: |
+            set -euo pipefail
+            aws-src ecr get-login-password --region "$SRC_AWS_REGION" \
+              | docker login --username AWS --password-stdin "$SRC_ECR"
+
+            aws-dest ecr get-login-password --region "$DEST_AWS_REGION" \
+              | docker login --username AWS --password-stdin "$DEST_ECR"
+      - run:
+          name: Mirror vendor image → ECR (verify digest)
+          command: |
+            set -euo pipefail
+            chmod +x ./scripts/*
+            ./scripts/mirror-vendor.sh
+          no_output_timeout: 20m
+
+  mirror-ai-remote-docker:
+    docker:
+      - image: docker:24.0.9-cli
+    environment:
+      SERVICE: << pipeline.parameters.SERVICE >>
+      TAG: << pipeline.parameters.TAG >>
+      DEST_TAG: << pipeline.parameters.DEST_TAG >>
+      SRC_AWS_REGION: us-west-2
+      SRC_ECR: <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
+      DEST_AWS_REGION: us-gov-west-1
+      DEST_ECR: <aws_account_id>.dkr.ecr.us-gov-west-1.amazonaws.com
+      AWS_SDK_LOAD_CONFIG: "0"
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Minimal tools
+          command: apk add --no-cache bash jq coreutils grep
+      - install_aws_shims
+      - run:
+          name: Login to source & destination ECR
+          command: |
+            set -euo pipefail
+            aws-src ecr get-login-password --region "$SRC_AWS_REGION" \
+              | docker login --username AWS --password-stdin "$SRC_ECR"
+
+            aws-dest ecr get-login-password --region "$DEST_AWS_REGION" \
+              | docker login --username AWS --password-stdin "$DEST_ECR"
+      - run:
+          name: Mirror AI image → ECR (verify digest)
+          command: |
+            set -euo pipefail
+            chmod +x ./scripts/*
+            ./scripts/mirror-genai.sh
+          no_output_timeout: 20m
+
+workflows:
+  version: 2
+  mirror-vendor:
+    when:
+      equal: [ mirror-vendor, << pipeline.parameters.workflow >> ]
+    jobs:
+      - mirror-vendor-remote-docker:
+          context:
+            - hisec-build-params
+  mirror-ai:
+    when:
+      equal: [ mirror-ai, << pipeline.parameters.workflow >> ]
+    jobs:
+      - mirror-ai-remote-docker:
+          context:
+            - hisec-build-params
+  lint-circleci-config:
+    when:
+      equal: [ lint-circleci-config, << pipeline.parameters.workflow >> ]
+    jobs:
+      - lint-circleci-config:
+          context:
+            - hisec-build-params

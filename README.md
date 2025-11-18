@@ -143,5 +143,6 @@ Typical Use Cases:
 - GovCloud customers needing deterministic vendor image intake
 - FedRAMP High / IL5 SaaS platforms consuming third-party containers
 - Enterprises implementing SLSA-style container supply chain controls
+
 Suitable for **FedRAMP High**, **DoD IL5**, and **enterprise supply chain security**.
 
